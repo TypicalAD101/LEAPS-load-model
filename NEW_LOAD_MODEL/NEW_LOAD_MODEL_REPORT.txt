@@ -1,0 +1,483 @@
+================================================================================
+                    NEW LOAD MODEL — DETAILED REPORT
+================================================================================
+Date:    February 27, 2026
+Author:  LEAPS Team (ASU)
+Repo:    https://github.com/TypicalAD101/LEAPS-load-model.git
+Branch:  new-load-model
+================================================================================
+
+
+TABLE OF CONTENTS
+─────────────────
+  1. Executive Summary
+  2. Problem Statement — Why the Old Model Fails on Load Data
+  3. What We Changed and Why
+  4. Architecture Overview
+  5. File-by-File Description
+  6. How to Execute the Pipeline (Step-by-Step)
+  7. Post-Training Checklist
+  8. Key Differences: Old Pipeline vs. New Pipeline
+  9. FAQ / Troubleshooting
+
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+We redesigned the electricity load forecasting pipeline to fix fundamental
+issues that caused the existing CNN-LSTM model to perform poorly on load data.
+The original model was built for solar generation and relied on daily seasonal
+differencing (lag=96), which is appropriate for solar (strong 24 h periodicity,
+zero at night) but destructive for load profiles (non-zero overnight, complex
+weekly/seasonal patterns).
+
+The new pipeline:
+  • REMOVES daily seasonal differencing entirely.
+  • ADDS 7 cyclical time features so the model is aware of hour-of-day,
+    day-of-week, month, and weekends.
+  • Predicts all 96 future timesteps in a SINGLE forward pass (seq2seq),
+    eliminating recursive error accumulation.
+  • Normalizes RAW load values with MinMaxScaler (not differenced values).
+
+All new code lives in the NEW_LOAD_MODEL/ folder. No existing files were
+modified.
+
+
+================================================================================
+2. PROBLEM STATEMENT — WHY THE OLD MODEL FAILS ON LOAD DATA
+================================================================================
+
+The original pipeline (trainCPU.py + implementation.py) was designed for solar
+generation forecasting and later applied to electricity load data. Several
+design decisions that work well for solar are harmful for load:
+
+2.1  DAILY DIFFERENCING (lag = 96)
+───────────────────────────────────
+  • Solar data has a very strong 24 h cycle (sunrise/sunset), so differencing
+    at lag=96 (one day at 15-minute resolution) removes that cycle and leaves
+    small residuals that are easy to model.
+  • Load data does NOT have the same structure. Load profiles vary by day-of-
+    week, holidays, seasons, and weather. Differencing at lag=96 assumes
+    "today looks like yesterday" — this destroys multi-day patterns (weekday
+    vs. weekend) and amplifies noise, making the residuals HARDER to model.
+  • Worse, the MinMaxScaler was fitted on these noisy differenced values,
+    so the normalization range was unstable and did not generalize well to
+    unseen test data.
+
+2.2  NO TIME AWARENESS
+──────────────────────
+  • The old model was UNIVARIATE — it saw only a sequence of 96 load values.
+    It had no information about what hour, day-of-week, or month the
+    predictions correspond to.
+  • Load patterns are highly dependent on these factors (e.g., weekday
+    morning ramp, weekend dip, summer cooling peaks). Without this context,
+    the model must infer temporal position purely from the load shape, which
+    is fragile and error-prone.
+
+2.3  RECURSIVE (AUTO-REGRESSIVE) FORECASTING
+─────────────────────────────────────────────
+  • The old implementation predicted one step at a time and fed each
+    prediction back as input for the next step (recursive / auto-regressive).
+  • This causes ERROR ACCUMULATION: a small mistake at step 1 shifts the
+    input for step 2, which shifts step 3, and so on. By step 96 (24 hours
+    out), compound errors can make the forecast useless.
+  • This approach was necessary because the old model output shape was
+    effectively (1,) per step. The new model outputs all 96 steps at once.
+
+2.4  SCALER MISMATCH
+─────────────────────
+  • In the old pipeline, the scaler (data_min / data_max in config.ini)
+    was fitted on DIFFERENCED training data. At inference time, the test
+    data was differenced and then normalized using those same bounds.
+  • If the test data's differenced values fell outside the training range,
+    normalization pushed values beyond [-1, 1], causing the model to
+    extrapolate in regions it was never trained on → poor predictions.
+  • The new pipeline fits the scaler on RAW load values, which are more
+    stable and bounded.
+
+
+================================================================================
+3. WHAT WE CHANGED AND WHY
+================================================================================
+
+CHANGE 1:  REMOVED DIFFERENCING
+────────────────────────────────
+  What:  Completely removed the .diff(96) call and all inverse-differencing
+         logic from both training and inference.
+  Why:   Differencing destroys multi-day patterns and amplifies noise for
+         load data. The model now learns to predict absolute load values
+         directly, which is simpler and more robust.
+
+CHANGE 2:  ADDED 7 CYCLICAL TIME FEATURES
+──────────────────────────────────────────
+  What:  Computed from timestamps and appended as channels 1–7 of the input:
+           0: hour_sin   = sin(2π × hour / 24)
+           1: hour_cos   = cos(2π × hour / 24)
+           2: dow_sin    = sin(2π × day_of_week / 7)
+           3: dow_cos    = cos(2π × day_of_week / 7)
+           4: month_sin  = sin(2π × (month − 1) / 12)
+           5: month_cos  = cos(2π × (month − 1) / 12)
+           6: is_weekend  = 1.0 if Saturday/Sunday, else 0.0
+  Why:   Gives the model explicit awareness of temporal context. Cyclical
+         encoding (sin/cos) preserves continuity (e.g., 23:45 is close to
+         00:00). The is_weekend binary flag captures the most important
+         categorical distinction in electricity demand.
+  Note:  The time features in X correspond to the OUTPUT (prediction) window,
+         not the input window. This tells the model "what time period am I
+         predicting for?" while the load channel tells it "what happened in
+         the previous 24 hours?"
+
+CHANGE 3:  INPUT SHAPE (96, 1) → (96, 8)
+─────────────────────────────────────────
+  What:  Model input changed from 1 channel (load only) to 8 channels
+         (1 load + 7 time features).
+  Why:   Direct consequence of Change 2. The CNN-LSTM architecture is
+         unchanged except for the input dimension.
+
+CHANGE 4:  SINGLE SEQ2SEQ FORWARD PASS (NO RECURSION)
+──────────────────────────────────────────────────────
+  What:  The model predicts all 96 output steps simultaneously in one forward
+         pass. At inference, there is no recursive loop.
+  Why:   Eliminates error accumulation. Every predicted timestep has the same
+         relationship to the input — there is no cascading of mistakes.
+         This is possible because the encoder-decoder architecture uses
+         RepeatVector(96) + LSTM decoder + TimeDistributed(Dense(1)),
+         producing shape (batch, 96, 1) in one shot.
+
+CHANGE 5:  SCALER ON RAW VALUES
+────────────────────────────────
+  What:  MinMaxScaler is fitted on the raw (after v3 preprocessing) load
+         values, mapping them to [-1, 1]. The scaler parameters (data_min,
+         data_max) saved in config.ini are for raw values.
+  Why:   Raw load values are more stable and bounded than differenced values.
+         Reduces the chance of out-of-range extrapolation at inference time.
+
+CHANGE 6:  HUBER LOSS WITH HORIZON DECAY WEIGHTING
+───────────────────────────────────────────────────
+  What:  Training uses Huber loss (delta=1.0) with linearly decaying weights
+         across the 96 output steps — earlier timesteps get higher weight.
+  Why:   Huber loss is robust to outliers (common in load data). Horizon
+         decay encourages the model to be especially accurate for near-term
+         predictions (1–6 hours ahead), which are most valuable operationally.
+
+
+================================================================================
+4. ARCHITECTURE OVERVIEW
+================================================================================
+
+  ┌───────────────────────────────────┐
+  │  Input: (batch, 96, 8)           │
+  │  Channel 0: scaled load history  │
+  │  Channels 1-7: time features     │
+  │    (for the prediction window)   │
+  └────────────┬──────────────────────┘
+               │
+  ┌────────────▼──────────────────────┐
+  │  Conv1D(128, k=3, relu, same)    │
+  │  BatchNorm → Conv1D(128) → BN    │
+  │  Dropout(0.09) → MaxPool1D(2)    │
+  │  Conv1D(256, k=3, relu, same)    │
+  │  BatchNorm → Dropout(0.09)       │
+  └────────────┬──────────────────────┘
+               │  (batch, 48, 256)
+  ┌────────────▼──────────────────────┐
+  │  LSTM Encoder (256 units)        │
+  │  return_sequences=False          │
+  │  Dropout(0.3)                    │
+  └────────────┬──────────────────────┘
+               │  (batch, 256)
+  ┌────────────▼──────────────────────┐
+  │  RepeatVector(96)                │
+  └────────────┬──────────────────────┘
+               │  (batch, 96, 256)
+  ┌────────────▼──────────────────────┐
+  │  LSTM Decoder (128 units)        │
+  │  return_sequences=True           │
+  │  Dropout(0.3)                    │
+  └────────────┬──────────────────────┘
+               │  (batch, 96, 128)
+  ┌────────────▼──────────────────────┐
+  │  TimeDistributed(Dense(64, relu))│
+  │  Dropout(0.15)                   │
+  │  TimeDistributed(Dense(1,linear))│
+  │  ClipByValue(-3.0, 3.0)         │
+  └────────────┬──────────────────────┘
+               │
+  ┌────────────▼──────────────────────┐
+  │  Output: (batch, 96, 1)          │
+  │  Scaled load prediction          │
+  └───────────────────────────────────┘
+
+  Total trainable parameters: ~1.2M (varies with tuner results)
+
+
+================================================================================
+5. FILE-BY-FILE DESCRIPTION
+================================================================================
+
+NEW_LOAD_MODEL/
+├── train_load.py                              [1321 lines]
+│     Complete training script. Handles:
+│       - GPU/multi-GPU configuration (MirroredStrategy)
+│       - Mixed precision (float16) training
+│       - v3 data preprocessing (gap classification, hierarchical filling)
+│       - compute_time_features() function (7 cyclical features)
+│       - TimeSeriesDataProcessor.create_windows() → (96, 8) → (96, 1)
+│       - OptimizedLSTMForecaster with build_model() and custom training loop
+│       - Keras Tuner (RandomSearch) for hyperparameter optimization
+│       - SavedModel export for CPU deployment
+│       - Saves scaler_params.json with data_min / data_max
+│
+├── ml_repository/
+│   ├── config.ini                             [template]
+│   │     Configuration for inference. Contains:
+│   │       - data_min / data_max (RAW scale — must be updated after training)
+│   │       - feature_range_min / feature_range_max (-1 / 1)
+│   │       - sequence_length = 96
+│   │       - n_input_features = 8
+│   │       - use_time_features = true
+│   │       - dataset_kind = load
+│   │     NOTE: NO daily_lag parameter (differencing removed)
+│   │
+│   └── implementation/
+│       └── implementation_load.py             [~600 lines]
+│             Inference/validation script. Handles:
+│               - CSV loading and format conversion (NREL, simple, Load_Profile)
+│               - Timestamp reconstruction and time feature computation
+│               - SavedModel / .keras / .h5 model loading (CPU-compatible)
+│               - _perform_seq2seq_forecast() — single forward pass prediction
+│               - run_simulation() — sliding window over test data
+│               - _generate_report() — long-format CSV with MAE/RMSE
+│               - _generate_wide_format_report() — wide CSV with per-window
+│                 Input / Actual / Predicted / Error columns
+│               - run_all_models_implementation() — batch mode for multiple
+│                 models and test CSVs
+│
+├── 03_train_load_tuner.slurm
+│     SLURM script for hyperparameter search on ASU Sol.
+│       - 2× A100 80GB GPUs, 500 GB RAM, 7-day time limit
+│       - Runs train_load.py --use_tuner --max_trials 5 --epochs_per_trial 5
+│
+└── 04_train_load_final.slurm
+      SLURM script for final model training on ASU Sol.
+        - 2× A100 80GB GPUs, 256 GB RAM, 7-day time limit
+        - Runs train_load.py --epochs 200 --batch_size 32
+        - Uses early stopping (patience 30)
+
+
+================================================================================
+6. HOW TO EXECUTE THE PIPELINE (STEP-BY-STEP)
+================================================================================
+
+PREREQUISITES:
+  • ASU Sol supercomputer access with SLURM
+  • Conda/mamba environment at /scratch/$USER/ts-train/env/tf_venv with:
+      tensorflow >= 2.14, keras-tuner, scikit-learn, pandas, numpy, matplotlib
+  • Load CSV data placed in /scratch/$USER/ts-train/data/LOADMODEL/
+    (CSV files with 'time' and 'value' columns, 15-min resolution)
+
+
+STEP 1: UPLOAD FILES TO SOL
+────────────────────────────
+Copy the NEW_LOAD_MODEL folder to your Sol home directory:
+
+    scp -r NEW_LOAD_MODEL/ $USER@sol.asu.edu:~/projects/ts-train/NEW_LOAD_MODEL/
+
+
+STEP 2: RUN HYPERPARAMETER SEARCH (OPTIONAL BUT RECOMMENDED)
+─────────────────────────────────────────────────────────────
+    cd ~/projects/ts-train/NEW_LOAD_MODEL
+    sbatch 03_train_load_tuner.slurm
+
+This runs Keras Tuner RandomSearch with 5 trials, 5 epochs each.
+Output goes to /scratch/$USER/ts-train/outputs/NEW_LOAD_MODEL/.
+
+Monitor progress:
+    tail -f /scratch/$USER/ts-train/logs/load-tuner-a100-<JOBID>.out
+
+When complete, note the best hyperparameters printed in the log.
+
+
+STEP 3: UPDATE HYPERPARAMETERS IN train_load.py
+────────────────────────────────────────────────
+Open train_load.py and update the default values in build_model():
+
+    lstm_units_encoder = <best value>
+    lstm_units_decoder = <best value>
+    dropout_rate = <best value>
+    learning_rate = <best value>
+    cnn_filters = <best value>
+
+If you skip the tuner (Step 2), the defaults are reasonable starting points.
+
+
+STEP 4: RUN FINAL TRAINING
+───────────────────────────
+    sbatch 04_train_load_final.slurm
+
+This trains for up to 200 epochs with early stopping (patience=30).
+Output:
+    /scratch/$USER/ts-train/outputs/NEW_LOAD_MODEL/final_model_run/
+      ├── saved_model/          ← SavedModel directory for CPU deployment
+      ├── best_model.keras      ← Keras checkpoint (best val loss)
+      ├── scaler_params.json    ← {"min_value": ..., "max_value": ...}
+      ├── training_metrics.json ← Loss curves and evaluation metrics
+      └── training_log.log      ← Full training log
+
+
+STEP 5: UPDATE config.ini WITH TRAINING RESULTS
+────────────────────────────────────────────────
+After training, open scaler_params.json and copy the values into
+ml_repository/config.ini:
+
+    [Model]
+    data_min = <min_value from scaler_params.json>
+    data_max = <max_value from scaler_params.json>
+
+This step is CRITICAL — without correct data_min/data_max, denormalization
+at inference will produce garbage results.
+
+
+STEP 6: RUN INFERENCE / VALIDATION
+───────────────────────────────────
+Copy the trained model and updated config.ini to the deployment machine.
+Place test CSVs in an implementation/ directory.
+
+    cd ml_repository/
+    mkdir -p models reports
+
+    # Copy saved_model directory into models/
+    cp -r /path/to/saved_model models/load_model_v1
+
+    # Run inference
+    python implementation/implementation_load.py
+
+Or use it programmatically:
+
+    from implementation.implementation_load import implementation_load
+
+    impl = implementation_load(
+        model_path="models/load_model_v1",
+        test_data_path="implementation/test_data.csv",
+        config_path="config.ini"
+    )
+    impl.load_dependencies()
+    metrics = impl.run_simulation()
+    print(metrics)
+
+Output reports are saved to reports/:
+    reports/performance_report_<model_name>.csv        ← long format
+    reports/performance_report_<model_name>_wide.csv   ← wide format
+
+
+================================================================================
+7. POST-TRAINING CHECKLIST
+================================================================================
+
+  [ ] Verify scaler_params.json was written by train_load.py
+  [ ] Update config.ini data_min / data_max with scaler values
+  [ ] Verify SavedModel loads on CPU (no GPU required for inference)
+  [ ] Run implementation_load.py on a known test CSV
+  [ ] Check reports/ for MAE values at each horizon (1h, 3h, 6h, 12h, 24h)
+  [ ] Compare MAE against the old model's performance
+  [ ] If MAE is worse at any horizon, consider:
+        - Running more tuner trials (--max_trials 20)
+        - Training for more epochs (--epochs 500)
+        - Checking data quality (too many NaN/zeros in training data)
+
+
+================================================================================
+8. KEY DIFFERENCES: OLD PIPELINE VS. NEW PIPELINE
+================================================================================
+
+┌─────────────────────┬──────────────────────────┬─────────────────────────────┐
+│  Aspect             │  OLD (trainCPU.py)       │  NEW (train_load.py)        │
+├─────────────────────┼──────────────────────────┼─────────────────────────────┤
+│  Differencing       │  .diff(lag=96) applied   │  NONE — raw values used     │
+│  Input shape        │  (96, 1)                 │  (96, 8)                    │
+│  Input features     │  Scaled load only        │  Scaled load + 7 time feat  │
+│  Output shape       │  (96, 1)                 │  (96, 1)                    │
+│  Scaler target      │  Differenced values      │  Raw load values            │
+│  Forecasting mode   │  Recursive (step-by-step)│  Single forward pass        │
+│  Error accumulation │  YES — compounds over    │  NO — all steps independent │
+│                     │  96 steps                │                             │
+│  Time awareness     │  NONE                    │  Hour, DoW, Month, Weekend  │
+│  Inverse transform  │  Denorm → undo diff      │  Denorm only (simpler)      │
+│  config.ini params  │  data_min, data_max,     │  data_min, data_max,        │
+│                     │  daily_lag=96            │  n_input_features=8         │
+│  Loss function      │  Huber + horizon decay   │  Huber + horizon decay      │
+│  Architecture       │  CNN-LSTM enc-dec        │  CNN-LSTM enc-dec (same)    │
+│  Training infra     │  Multi-GPU + mixed prec  │  Multi-GPU + mixed prec     │
+│  SavedModel export  │  Yes                     │  Yes                        │
+└─────────────────────┴──────────────────────────┴─────────────────────────────┘
+
+
+================================================================================
+9. FAQ / TROUBLESHOOTING
+================================================================================
+
+Q: Can I still use this model for solar data?
+A: No. This pipeline is designed specifically for load data. The solar model
+   (which uses differencing) remains in the original trainCPU.py / 
+   implementation.py files and was not modified.
+
+Q: Why are the time features for the OUTPUT window placed in X, not for the
+   INPUT window?
+A: The model needs to know WHEN it is predicting, not when the input happened.
+   The load channel already encodes "what happened yesterday." The time
+   features answer "what time period am I predicting for?" This is analogous
+   to telling someone: "Here's yesterday's power usage — now forecast for
+   tomorrow, which is a Monday in July."
+
+Q: What if my CSV has a different format?
+A: convert_csv_format() in implementation_load.py handles three formats:
+     1) NREL solar format (LocalTime + Power(MW))
+     2) Simple format (time/timestamp + value/generation)
+     3) Load_Profile format (Day, Month, Year, Time, controllableLoadForecast_0)
+   If your CSV doesn't match any of these, rename columns to 'time' and
+   'value' before running.
+
+Q: What if training runs out of memory?
+A: Try:
+     - Reduce --batch_size (e.g., 16 instead of 32)
+     - The A100 80GB should handle batch_size=128 for tuner and 32 for final
+     - Check that TF_FORCE_GPU_ALLOW_GROWTH=true is set in the SLURM script
+
+Q: How do I know if the model is better than the old one?
+A: Compare the MAE values at each horizon (especially 3h and 6h) from the
+   wide-format report. Lower MAE = better. The old model's MAE can be found
+   in the reports generated by the original implementation.py.
+
+Q: What if I want to add more input features (e.g., temperature, holidays)?
+A: Increase n_input_features in both train_load.py and config.ini. Add the
+   new feature columns in compute_time_features() (or a new function).
+   Update create_windows() to include them. The model architecture
+   automatically adapts to the wider input.
+
+Q: What data format does training expect?
+A: CSV files in the --data_dir with at least two columns:
+     - 'time' (or 'timestamp', 'datetime', 'LocalTime'): datetime strings
+     - 'value' (or 'power', 'generation', 'mw'): numeric load values
+   Data should be at 15-minute resolution. The v3 preprocessor handles
+   gaps, zeros, and missing values automatically.
+
+Q: Why is the ClipByValue(-3, 3) layer in the output?
+A: It acts as a soft safety net. During training, the model learns to produce
+   outputs in the [-1, 1] range (matching the scaler). The clip at [-3, 3]
+   prevents extreme outlier predictions without constraining normal
+   operation. At inference, predictions almost never hit the clip boundary.
+
+Q: My predictions are all flat / constant — what's wrong?
+A: Check:
+     1) config.ini data_min and data_max are correct (from training)
+     2) The test data is not all zeros or NaN
+     3) The model was trained long enough (check training_metrics.json for
+        val_loss convergence)
+     4) Verify model architecture with verify_model_architecture() —
+        it should NOT have GlobalAveragePooling
+
+
+================================================================================
+END OF REPORT
+================================================================================
