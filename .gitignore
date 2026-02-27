@@ -1,0 +1,26 @@
+# Large binary files
+*.zip
+*.h5
+*.keras
+*.pb
+*.data-00000-of-00001
+*.index
+variables/
+fingerprint.pb
+
+# Model output folders (old runs)
+LOADMODEL/
+LOADMODEL/final_model_run/
+
+# Cache files
+*_cache*
+
+# TF/Keras tuner trials (binary)
+keras_tuner/
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
